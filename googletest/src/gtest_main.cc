@@ -28,11 +28,10 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <stdio.h>
-
 #include "gtest/gtest.h"
 
-GTEST_MAIN_API_ int main(int argc, char **argv) {
-  printf("Running main() from gtest_main.cc\n");
+GTEST_API_ int main(int argc, char **argv) {
+  printf("Running main() from %s\n", __FILE__);
   testing::InitGoogleTest(&argc, argv);
   const int result = RUN_ALL_TESTS();
 #if (GTEST_OS_IOS)

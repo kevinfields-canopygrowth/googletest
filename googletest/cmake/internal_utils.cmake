@@ -20,7 +20,7 @@ macro(fix_default_compiler_settings_)
   if (MSVC)
     # For MSVC, CMake sets certain flags to defaults we want to override.
     # This replacement code is taken from sample in the CMake Wiki at
-    # http://www.cmake.org/Wiki/CMake_FAQ#Dynamic_Replace.
+    # https://gitlab.kitware.com/cmake/community/wikis/FAQ#dynamic-replace.
     foreach (flag_var
              CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE
              CMAKE_CXX_FLAGS_MINSIZEREL CMAKE_CXX_FLAGS_RELWITHDEBINFO)
@@ -38,6 +38,11 @@ macro(fix_default_compiler_settings_)
       # We prefer more strict warning checking for building Google Test.
       # Replaces /W3 with /W4 in defaults.
       string(REPLACE "/W3" "/W4" ${flag_var} "${${flag_var}}")
+
+      # Prevent D9025 warning for targets that have exception handling
+      # turned off (/EHs-c- flag). Where required, exceptions are explicitly
+      # re-enabled using the cxx_exception_flags variable.
+      string(REPLACE "/EHsc" "" ${flag_var} "${${flag_var}}")
     endforeach()
   endif()
 endmacro()
@@ -93,10 +98,13 @@ macro(config_compiler_and_linker)
     set(cxx_base_flags "${cxx_base_flags} -D_UNICODE -DUNICODE -DWIN32 -D_WIN32")
     set(cxx_base_flags "${cxx_base_flags} -DSTRICT -DWIN32_LEAN_AND_MEAN")
     set(cxx_exception_flags "-EHsc -D_HAS_EXCEPTIONS=1")
-    set(cxx_no_exception_flags "-D_HAS_EXCEPTIONS=0")
+    set(cxx_no_exception_flags "-EHs-c- -D_HAS_EXCEPTIONS=0")
     set(cxx_no_rtti_flags "-GR-")
   elseif (CMAKE_COMPILER_IS_GNUCXX)
     set(cxx_base_flags "-Wall -Wshadow -Werror")
+    if(NOT CMAKE_CXX_COMPILER_VERSION VERSION_LESS 7.0.0)
+      set(cxx_base_flags "${cxx_base_flags} -Wno-error=dangling-else")
+    endif()
     set(cxx_exception_flags "-fexceptions")
     set(cxx_no_exception_flags "-fno-exceptions")
     # Until version 4.3.2, GCC doesn't define a macro to indicate
@@ -137,7 +145,7 @@ macro(config_compiler_and_linker)
   set(cxx_base_flags "${cxx_base_flags} ${GTEST_HAS_PTHREAD_MACRO}")
 
   # For building gtest's own tests and samples.
-  set(cxx_exception "${CMAKE_CXX_FLAGS} ${cxx_base_flags} ${cxx_exception_flags}")
+  set(cxx_exception "${cxx_base_flags} ${cxx_exception_flags}")
   set(cxx_no_exception
     "${CMAKE_CXX_FLAGS} ${cxx_base_flags} ${cxx_no_exception_flags}")
   set(cxx_default "${cxx_exception}")
@@ -157,13 +165,26 @@ function(cxx_library_with_type name type cxx_flags)
   set_target_properties(${name}
     PROPERTIES
     COMPILE_FLAGS "${cxx_flags}")
+  # Generate debug library name with a postfix.
+  set_target_properties(${name}
+    PROPERTIES
+    DEBUG_POSTFIX "d")
   if (BUILD_SHARED_LIBS OR type STREQUAL "SHARED")
     set_target_properties(${name}
       PROPERTIES
       COMPILE_DEFINITIONS "GTEST_CREATE_SHARED_LIBRARY=1")
+    if (NOT "${CMAKE_VERSION}" VERSION_LESS "2.8.11")
+      target_compile_definitions(${name} INTERFACE
+        $<INSTALL_INTERFACE:GTEST_LINKED_AS_SHARED_LIBRARY=1>)
+    endif()
   endif()
   if (DEFINED GTEST_HAS_PTHREAD)
-    target_link_libraries(${name} ${CMAKE_THREAD_LIBS_INIT})
+    if ("${CMAKE_VERSION}" VERSION_LESS "3.1.0")
+      set(threads_spec ${CMAKE_THREAD_LIBS_INIT})
+    else()
+      set(threads_spec Threads::Threads)
+    endif()
+    target_link_libraries(${name} PUBLIC ${threads_spec})
   endif()
 endfunction()
 
@@ -225,7 +246,7 @@ find_package(PythonInterp)
 # from the given source files with the given compiler flags.
 function(cxx_test_with_flags name cxx_flags libs)
   cxx_executable_with_flags(${name} "${cxx_flags}" "${libs}" ${ARGN})
-  add_test(${name} ${name})
+  add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
 # cxx_test(name libs srcs...)
@@ -252,14 +273,14 @@ function(py_test name)
         add_test(
           NAME ${name}
           COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/${name}.py
-              --build_dir=${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>)
+              --build_dir=${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG> ${ARGN})
       else (CMAKE_CONFIGURATION_TYPES)
 	# Single-configuration build generators like Makefile generators
 	# don't have subdirs below CMAKE_CURRENT_BINARY_DIR.
         add_test(
           NAME ${name}
           COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/${name}.py
-              --build_dir=${CMAKE_CURRENT_BINARY_DIR})
+              --build_dir=${CMAKE_CURRENT_BINARY_DIR} ${ARGN})
       endif (CMAKE_CONFIGURATION_TYPES)
     else (${CMAKE_MAJOR_VERSION}.${CMAKE_MINOR_VERSION} GREATER 3.1)
       # ${CMAKE_CURRENT_BINARY_DIR} is known at configuration time, so we can
@@ -269,183 +290,31 @@ function(py_test name)
       add_test(
         ${name}
         ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/${name}.py
-          --build_dir=${CMAKE_CURRENT_BINARY_DIR}/\${CTEST_CONFIGURATION_TYPE})
+          --build_dir=${CMAKE_CURRENT_BINARY_DIR}/\${CTEST_CONFIGURATION_TYPE} ${ARGN})
     endif (${CMAKE_MAJOR_VERSION}.${CMAKE_MINOR_VERSION} GREATER 3.1)
   endif(PYTHONINTERP_FOUND)
 endfunction()
 
-# Adds the given macro definition to the interface of the target when compiling as shared library and msvc.
-function( add_export_macro_interface_defintion target definition )
-  if(MSVC)
-    get_property(type TARGET ${target} PROPERTY TYPE)
-    if( ${type} STREQUAL SHARED_LIBRARY )
-      target_compile_definitions( ${target} INTERFACE ${definition})
-    endif()
-  endif()
-endfunction()
-
-# add_install_rules( package targets)
+# install_project(targets...)
 #
-# Adds install rules for the GMock and GTest packages.
-function( add_install_rules package targets )
-
-  set(config_install_dir "${CMAKE_INSTALL_LIBDIR}/cmake/${package}")
-
-  set(generated_dir "${CMAKE_CURRENT_BINARY_DIR}/generated")
-
-  # Configuration
-  set(version_config "${generated_dir}/${package}ConfigVersion.cmake")
-  set(project_config "${generated_dir}/${package}Config.cmake")
-  set(targets_export_name "${package}Targets")
-  set(namespace "${package}::")
-
-  # Include module with fuction 'write_basic_package_version_file'
-  include(CMakePackageConfigHelpers)
-
-  # Configure '<PROJECT-NAME>ConfigVersion.cmake'
-  # Note: PROJECT_VERSION is used as a VERSION
-  write_basic_package_version_file(
-    "${version_config}" COMPATIBILITY SameMajorVersion
-  )
-
-  # Configure '<PROJECT-NAME>Config.cmake'
-  # Use variables:
-  #   * targets_export_name
-  #   * PROJECT_NAME
-  configure_package_config_file(
-    "cmake/Config.cmake.in"
-    "${project_config}"
-    INSTALL_DESTINATION "${config_install_dir}"
-  )
-
-  # Targets:
-  install(
-    TARGETS ${targets}
-    EXPORT "${targets_export_name}"
-    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
-    INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
-  )
-
-  # Headers:
-  string(TOLOWER ${package} package_lower)
-  install(
-    DIRECTORY ${${package_lower}_SOURCE_DIR}/include/${package_lower}
-    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
-    FILES_MATCHING PATTERN "*.h"
-  )
-
-  # Config
-  install(
-    FILES "${project_config}" "${version_config}"
-    DESTINATION "${config_install_dir}"
-  )
-
-  # Config
-  install(
-    EXPORT "${targets_export_name}"
-    NAMESPACE "${namespace}"
-    DESTINATION "${config_install_dir}"
-  )
-
-  # Debug information .pdb for MSVC
-  foreach(target ${targets})
-    install_pdb_files(${target})
-  endforeach()
-
-endfunction()
-
-
-# install_pdb_files( target )
-#
-# Makes sure that compiler and linker generated .pdb files ares installed
-# when compiling with MSVC and debug options.
-function( install_pdb_files target )
-  if( NOT ${CMAKE_VERSION} VERSION_LESS 3.1.0)    # COMPILE_PDB_... properties where introduced with cmake 3.1
-    foreach( config ${CMAKE_BUILD_TYPE} ${CMAKE_CONFIGURATION_TYPES})
-      string( TOUPPER ${config} config_suffix)
-
-      get_property( name_config_postfix TARGET ${target} PROPERTY ${config_suffix}_POSTFIX )
-      set( output_dir ${CMAKE_CURRENT_BINARY_DIR}/${config}  )
-
-      # Set output names and install rules for .pdb files that are generated by the compiler
-      target_has_pdb_compile_output( has_pdb_compiler_output ${target} ${config})
-      if(has_pdb_compiler_output)
-        
-        set( output_name ${target}${name_config_postfix}-compiler )
-        set_property( TARGET ${target} PROPERTY COMPILE_PDB_NAME_${config_suffix} ${output_name} )
-        set_property( TARGET ${target} PROPERTY COMPILE_PDB_OUTPUT_DIRECTORY_${config_suffix} ${output_dir} )
-
-        install( 
-          FILES ${output_dir}/${output_name}.pdb
-          DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-          CONFIGURATIONS ${config}
-        )
-
-      endif()
-
-      # Set output names and install rules for .pdb files that are generated by the linker
-      target_has_pdb_linker_output( has_pdb_linker_output ${target} ${config})
-      if(has_pdb_linker_output)
-
-        set( output_name ${target}${name_config_postfix}-linker )
-        set_property( TARGET ${target} PROPERTY PDB_NAME_${config_suffix} ${output_name} )
-        set_property( TARGET ${target} PROPERTY PDB_OUTPUT_DIRECTORY_${config_suffix} ${output_dir} )
-
-        install( 
-          FILES ${output_dir}/${output_name}.pdb
-          DESTINATION "${CMAKE_INSTALL_BINDIR}"
-          CONFIGURATIONS ${config}
-        )
-
-      endif()
-
+# Installs the specified targets and configures the associated pkgconfig files.
+function(install_project)
+  if(INSTALL_GTEST)
+    install(DIRECTORY "${PROJECT_SOURCE_DIR}/include/"
+      DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+    # Install the project targets.
+    install(TARGETS ${ARGN}
+      EXPORT ${targets_export_name}
+      RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+      ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+      LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+    # Configure and install pkgconfig files.
+    foreach(t ${ARGN})
+      set(configured_pc "${generated_dir}/${t}.pc")
+      configure_file("${PROJECT_SOURCE_DIR}/cmake/${t}.pc.in"
+        "${configured_pc}" @ONLY)
+      install(FILES "${configured_pc}"
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig")
     endforeach()
-  endif()
-endfunction()
-
-# Checks if the compile flags of the given target and configuration
-# are set to create the .pdb debug files of the msvc compiler.
-function( target_has_pdb_compile_output bOut target config )
-  string( TOUPPER ${config} config_suffix)
-  flags_contain_debug_flags( has_pdb_flags "${CMAKE_CXX_FLAGS_${config_suffix}} ${CMAKE_CXX_FLAGS}")
-  set( ${bOut} ${has_pdb_flags} PARENT_SCOPE )
-endfunction()
-
-# Takes a compile flags string as argument and returns true if it contains the /Zi or /ZI flags. 
-function( flags_contain_debug_flags bOut flags )
-  if(MSVC)
-    has_substring( has_flag1 ${flags} /ZI )
-    has_substring( has_flag2 ${flags} /Zi )
-    if( has_flag1 OR has_flag2)
-      set( ${bOut} TRUE PARENT_SCOPE)
-      return()
-    endif()
-  endif()
-  set( ${bOut} FALSE PARENT_SCOPE)
-endfunction()
-
-# Checks if the compile flags of the given target and configuration
-# are set to create the .pdb debug files that are generated by the linker.
-function( target_has_pdb_linker_output bOut target config )
-    target_has_pdb_compile_output( has_pdb_compile_output ${target} ${config} )
-    if(has_pdb_compile_output)
-      get_property( target_type TARGET ${target} PROPERTY TYPE)
-      if(${target_type} STREQUAL SHARED_LIBRARY OR ${target_type} STREQUAL MODULE_LIBRARY OR ${target_type} STREQUAL EXECUTABLE)
-        set(${bOut} TRUE PARENT_SCOPE)
-        return()
-      endif()
-    endif()
-    set(${bOut} FALSE PARENT_SCOPE)
-endfunction()
-
-# Returns true if a given string contains the given substring.
-function( has_substring bOut string substring )
-  string(FIND ${string} ${substring} index)
-  if( ${index} GREATER -1 )
-    set( ${bOut} TRUE PARENT_SCOPE)
-  else()
-    set( ${bOut} FALSE PARENT_SCOPE)
   endif()
 endfunction()
